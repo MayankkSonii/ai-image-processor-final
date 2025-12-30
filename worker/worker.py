@@ -15,13 +15,24 @@ listen = ['default']
 redis_url = settings.REDIS_URL
 
 if __name__ == '__main__':
+    import time
+    conn = None
+    retries = 10
+    while retries > 0:
+        try:
+            logger.info(f"Connecting to Redis at {redis_url} (Retries left: {retries})...")
+            conn = redis.from_url(redis_url)
+            conn.ping()
+            break
+        except Exception as e:
+            retries -= 1
+            if retries == 0:
+                logger.error(f"Could not connect to Redis after 10 attempts: {e}")
+                sys.exit(1)
+            time.sleep(3)
+
     logger.info(f"Worker starting. Listening on queues: {listen}")
-    try:
-        conn = redis.from_url(redis_url)
-        with Connection(conn):
-            worker = Worker(list(map(Queue, listen)))
-            logger.info("Worker connection established. Ready for jobs.")
-            worker.work()
-    except Exception as e:
-        logger.error(f"Worker failed to start or lost connection: {e}")
-        sys.exit(1)
+    with Connection(conn):
+        worker = Worker(list(map(Queue, listen)))
+        logger.info("Worker connection established. Ready for jobs.")
+        worker.work()

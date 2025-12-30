@@ -17,10 +17,9 @@ with st.sidebar:
     scale = st.selectbox("Upscale Factor", [2, 3, 4], index=2, help="2x is much faster. 3x/4x provides higher resolution.")
     model_type = st.selectbox("AI Model", [
         "RealESRGAN_x4plus (General)", 
-        "RealESRGAN_x4plus_anime_6B (Anime/Art)",
         "FSRCNN (Fast CPU Optimized)",
         "Standard (High Speed / No AI)"
-    ], index=3, help="FSRCNN is 5-10x faster. Standard is instantaneous.")
+    ], index=2, help="FSRCNN is 5-10x faster. Standard is instantaneous.")
     
     st.info("💡 **Performance Tip**: AI upscaling on Intel CPUs is slow. For bulk business workflows, use **FSRCNN** or **Standard** mode.")
     

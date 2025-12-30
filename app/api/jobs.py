@@ -75,7 +75,7 @@ class JobResponseExtended(JobResponse):
 
 @router.get("/{job_id}", response_model=JobResponseExtended)
 async def get_job_status(job_id: str):
-    logger.info(f"Status check requested for job_id: {job_id}")
+    logger.debug(f"Status check requested for job_id: {job_id}")
     try:
         job = Job.fetch(job_id, connection=redis_conn)
     except NoSuchJobError:
@@ -96,9 +96,8 @@ async def get_job_status(job_id: str):
     processed_files = job.meta.get('processed_files', [])
     if status == JobStatus.COMPLETED: 
         progress = 100
-        logger.info(f"Job {job_id} is completed.")
     else:
-        logger.info(f"Job {job_id} current status: {status}, progress: {progress}%")
+        logger.debug(f"Job {job_id} current status: {status}, progress: {progress}%")
         
     return {
         "job_id": job_id,

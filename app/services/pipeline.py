@@ -3,6 +3,7 @@ import shutil
 import zipfile
 from PIL import Image, ImageEnhance, ImageFilter
 from rq import get_current_job
+import concurrent.futures
 from app.core.config import settings
 from app.utils.logging_utils import setup_logger
 
@@ -36,18 +37,33 @@ try:
             result = self.sr.upsample(img)
             return result, None
 
+except ImportError as e:
+    # This is expected in the API container, as it doesnt need AI libs to queue jobs.
+    logger.debug(f"AI libraries (torch/realesrgan) not found: {e}. Worker functionality will be limited to 'Standard' mode.")
+    pass
 except Exception as e:
-    logger.error(f"Failed to import RealESRGAN/Torch: {e}")
+    logger.warning(f"Unexpected error during AI library initialization: {e}")
     pass
 
 def download_weights(url, dest):
-    if not os.path.exists(dest):
-        logger.info(f"Downloading weights from {url} to {dest}")
-        import requests
+    # Check if exists AND has reasonable size (> 1MB)
+    if os.path.exists(dest) and os.path.getsize(dest) > 1024 * 1024:
+        return
+
+    logger.info(f"Downloading weights from {url} to {dest}")
+    import requests
+    temp_dest = dest + ".tmp"
+    try:
         response = requests.get(url, stream=True)
-        with open(dest, 'wb') as f:
+        response.raise_for_status()
+        with open(temp_dest, 'wb') as f:
             for chunk in response.iter_content(chunk_size=8192):
                 f.write(chunk)
+        os.rename(temp_dest, dest)
+    except Exception as e:
+        if os.path.exists(temp_dest):
+            os.remove(temp_dest)
+        raise Exception(f"Failed to download weights: {e}")
 
 def process_job_task(job_id, file_paths, config):
     job = get_current_job()
@@ -57,17 +73,23 @@ def process_job_task(job_id, file_paths, config):
     os.makedirs(processed_dir, exist_ok=True)
     
     # Weights Dir
-    weights_dir = "weights"
+    # Weights Dir (Persistent across container restarts)
+    weights_dir = os.path.join(settings.DATA_DIR, "weights")
     os.makedirs(weights_dir, exist_ok=True)
     
     total = len(file_paths)
     
     # Initialize AI model if needed
     upsampler = None
-    if config.get('upscale_enabled') and HAS_AI:
+    if config.get('upscale_enabled'):
         model_type_sel = config.get('model_name', 'RealESRGAN_x4plus')
         target_scale = config.get('upscale_factor', 4)
-
+        
+        if not HAS_AI and model_type_sel != 'Standard':
+            error_msg = f"AI libraries (torch/opencv-dnn) are missing. Cannot run {model_type_sel}."
+            logger.error(f"[{job_id}] {error_msg}")
+            raise Exception(error_msg)
+            
         if model_type_sel == 'Standard':
              logger.info(f"[{job_id}] Standard scaling selected. Skipping AI for maximum speed.")
              upsampler = None
@@ -88,11 +110,7 @@ def process_job_task(job_id, file_paths, config):
 
         elif 'RealESRGAN' in model_type_sel:
              # Map selection to file/config
-             if model_type_sel == 'RealESRGAN_x4plus_anime_6B':
-                 model_name = 'RealESRGAN_x4plus_anime_6B'
-                 scale = 4
-                 url_tag = 'v0.1.0'
-             elif target_scale == 2:
+             if target_scale == 2:
                  model_name = 'RealESRGAN_x2plus'
                  scale = 2
                  url_tag = 'v0.2.1'
@@ -113,8 +131,6 @@ def process_job_task(job_id, file_paths, config):
              # RRDBNet Configs
              if model_name == 'RealESRGAN_x4plus':
                  model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=4)
-             elif model_name == 'RealESRGAN_x4plus_anime_6B':
-                 model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=6, num_grow_ch=32, scale=4)
              elif model_name == 'RealESRGAN_x2plus':
                  model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=2)
              
@@ -133,102 +149,77 @@ def process_job_task(job_id, file_paths, config):
              )
              logger.info(f"[{job_id}] AI upsampler ready.")
     
-    for i, file_path in enumerate(file_paths):
-        out_name = None # Initialize scope
+    # Concurrency limit: 
+    # AI models (Real-ESRGAN/FSRCNN) are NOT thread-safe and are RAM heavy.
+    # We must use 1 thread for AI. For Standard mode, we can use the env setting.
+    is_standard = config.get('model_name') == 'Standard'
+    max_workers = settings.WORKER_CONCURRENCY if is_standard else 1
+    
+    logger.info(f"[{job_id}] Processing {total} files using {max_workers} thread(s). (AI: {not is_standard})")
+    
+    def process_single_file(index_and_path):
+        i, file_path = index_and_path
+        filename = os.path.basename(file_path)
         try:
-            filename = os.path.basename(file_path)
-            logger.info(f"[Job {job_id}] Processing file {i+1}/{total}: {filename}")
-            
+            logger.info(f"[{job_id}] Thread started for file {i+1}/{total}: {filename}")
             img = Image.open(file_path).convert('RGB')
-            logger.info(f"[Job {job_id}] Image loaded: {filename} (Size: {img.size})")
             
-            # 1. Resize (Pre-Upscale)
+            # 1. Resize
             rw = config.get('resize_width')
             rh = config.get('resize_height')
             if rw or rh:
                 orig_w, orig_h = img.size
                 if not rw: rw = int(orig_w * (rh / orig_h))
                 if not rh: rh = int(orig_h * (rw / orig_w))
-                logger.info(f"[Job {job_id}] Resizing {filename} to {rw}x{rh}")
                 img = img.resize((rw, rh), Image.LANCZOS)
-            # 2. AI Upscale (or Standard Resize)
-            if config.get('upscale_enabled') and upsampler is not None:
-                if not HAS_AI:
-                    raise Exception("AI Engine (Real-ESRGAN/FSRCNN) failed to load.")
                 
-                # Convert PIL RGB to OpenCV BGR
+            # 2. Upscale
+            if config.get('upscale_enabled') and upsampler is not None:
                 img_np = np.array(img)
                 img_cv2 = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
-                
-                # Enhance
-                logger.info(f"[Job {job_id}] Starting AI Upscale for {filename} (Factor: {config.get('upscale_factor', 4)})")
                 output, _ = upsampler.enhance(img_cv2, outscale=config.get('upscale_factor', 4))
-                logger.info(f"[Job {job_id}] AI Upscale completed for {filename}")
-                
-                # Convert Back to PIL RGB
-                img_np_out = cv2.cvtColor(output, cv2.COLOR_BGR2RGB)
-                img = Image.fromarray(img_np_out)
+                img = Image.fromarray(cv2.cvtColor(output, cv2.COLOR_BGR2RGB))
             elif config.get('upscale_enabled') and upsampler is None:
-                # Standard Resize to target scale
                 target_factor = config.get('upscale_factor', 4)
                 w, h = img.size
-                logger.info(f"[Job {job_id}] Applying standard {target_factor}x scaling for {filename}")
                 img = img.resize((w * target_factor, h * target_factor), Image.LANCZOS)
             
-            # 3. Post-Processing (Production Grade)
-            from PIL import ImageEnhance, ImageFilter
-            
+            # 3. Sharpening
             if config.get('ultra_sharpen'):
-                logger.info(f"[{job_id}] Applying ULTRA SHARPENING for maximum clarity.")
-                # Stage 1: Strong UnsharpMask
                 img = img.filter(ImageFilter.UnsharpMask(radius=2, percent=250, threshold=0))
-                # Stage 2: Software Sharpness Boost
                 enhancer = ImageEnhance.Sharpness(img)
                 img = enhancer.enhance(2.0)
-                # Stage 3: Contrast Boost for Text Clarity
-                enhancer = ImageEnhance.Contrast(img)
-                img = enhancer.enhance(1.2)
+                img = ImageEnhance.Contrast(img).enhance(1.2)
             else:
-                # Standard Sharpen
                 img = img.filter(ImageFilter.UnsharpMask(radius=1, percent=100, threshold=3))
-                # Slight Contrast Boost
-                enhancer = ImageEnhance.Contrast(img)
-                img = enhancer.enhance(1.05)
-             
+            
             # 4. Save
             out_format = config.get('output_format', 'PNG')
             base, _ = os.path.splitext(filename)
             out_name = f"{base}.{out_format.lower()}"
             save_path = os.path.join(processed_dir, out_name)
             
-            save_kwargs = {}
-            if out_format in ['JPEG', 'WEBP']:
-                save_kwargs['quality'] = config.get('quality', 90)
-            
-            logger.info(f"[{job_id}] Step 4/4: Saving processed image: {out_name}")
+            save_kwargs = {'quality': config.get('quality', 90)} if out_format in ['JPEG', 'WEBP'] else {}
             img.save(save_path, format=out_format, **save_kwargs)
             
-            # Update Meta (Success Case)
+            logger.info(f"[{job_id}] File {i+1}/{total} completed: {out_name}")
+            
+            # Update Meta
             if job:
-                if 'processed_files' not in job.meta:
-                    job.meta['processed_files'] = []
-                
-                job.meta['processed_files'].append({
-                    'filename': out_name,
-                    'url': f"/jobs/{job_id}/file/{out_name}"
-                })
-                job.save_meta()
-            
+                with job.connection.lock(f"lock:job:meta:{job_id}"):
+                    processed = job.meta.get('processed_files', [])
+                    processed.append({'filename': out_name, 'url': f"/jobs/{job_id}/file/{out_name}"})
+                    job.meta['processed_files'] = processed
+                    progress = int(((len(processed)) / total) * 100)
+                    job.meta['progress'] = progress
+                    job.save_meta()
+            return True
         except Exception as e:
-            logger.error(f"[{job_id}] Failed to process {filename}: {e}", exc_info=True)
-            # Continue to next file
-            
-        # Update Overall Progress
-        if job:
-            progress = int(((i + 1) / total) * 100)
-            job.meta['progress'] = progress
-            job.save_meta()
-            logger.info(f"[{job_id}] Progress: {progress}% ({i+1}/{total} files)")
+            logger.error(f"[{job_id}] Thread FAILED for file {filename}: {e}")
+            return False
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        list(executor.map(process_single_file, enumerate(file_paths)))
             
     logger.info(f"[{job_id}] All files processed. Bundling into zip...")
     zip_path = os.path.join(settings.ZIP_DIR, f"{job_id}.zip")
@@ -237,5 +228,5 @@ def process_job_task(job_id, file_paths, config):
             for file in files:
                 zf.write(os.path.join(root, file), file)
                 
-    logger.info(f"[{job_id}] Job Completed successfully. Package: {zip_path}")
+    logger.info(f"[{job_id}] SECURE BUNDLE CREATED at {zip_path}. Distribution ready.")
     return {"status": "completed", "zip": zip_path}
