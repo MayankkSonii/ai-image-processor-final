@@ -1,3 +1,12 @@
+# Project Data
+uploads/
+processed/
+zips/
+app_data/
+weights/
+logs/
+
+# Python
 __pycache__/
 *.pyc
 *.pyo
@@ -7,14 +16,19 @@ env/
 venv/
 .env
 .venv
-env.bak/
-venv.bak/
+*.log
 
-# Project Specific
-app_data/
-weights/
-logs/
+# OS
 .DS_Store
+Thumbs.db
 
 # Docker
 docker-compose.override.yml
+
+# IDE
+.vscode/
+.idea/
+
+# Large binaries/embedded repos
+project-repo/
+docker-compose
