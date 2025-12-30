@@ -1,0 +1,17 @@
+.git
+project-repo
+weights
+uploads
+processed
+docker-compose
+.DS_Store
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.env
+.venv
+venv
+node_modules
+dist
+build

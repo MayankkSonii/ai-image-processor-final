@@ -1,0 +1,68 @@
+
+
+services:
+  redis:
+    image: redis:7-alpine
+    restart: always
+    ports:
+      - "6379:6379"
+    networks:
+      - app_network
+
+  api:
+    build:
+      context: .
+      dockerfile: docker/api.Dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./app:/app/app
+      - app_data:/data
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - DATA_DIR=/data
+    depends_on:
+      - redis
+    networks:
+      - app_network
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload --log-level warning
+
+  worker:
+    build:
+      context: .
+      dockerfile: docker/worker.Dockerfile
+    volumes:
+      - ./app:/app/app
+      - ./worker:/app/worker
+      - app_data:/data
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - DATA_DIR=/data
+    depends_on:
+      - redis
+    networks:
+      - app_network
+    command: python worker/worker.py
+
+  frontend:
+    build:
+      context: .
+      dockerfile: docker/frontend.Dockerfile
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./frontend:/app/frontend
+      - app_data:/data
+    environment:
+      - API_URL=http://api:8000
+    depends_on:
+      - api
+    networks:
+      - app_network
+
+volumes:
+  app_data:
+
+networks:
+  app_network:
+    driver: bridge
